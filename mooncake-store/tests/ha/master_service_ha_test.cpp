@@ -6782,6 +6782,84 @@ TEST_F(MasterServiceHATest, SegmentLifecycleWritesBatchRecordOpLogs) {
     EXPECT_FALSE(unmount_batch.entries[0].payload.empty());
 }
 
+TEST_F(MasterServiceHATest, BatchPromotionRestoresSharedEndpointSegments) {
+    const std::string cluster_id = "batch_promotion_shared_endpoint";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .set_memory_allocator(BufferAllocatorType::OFFSET)
+                      .build();
+    MasterService primary(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(primary).SetBatchOpLogBackendForTesting(backend));
+
+    const UUID client_id = generate_uuid();
+    Segment first = MakeSegment("127.0.0.1:19000");
+    first.te_endpoint = "127.0.0.1:19001";
+    first.protocol = "tcp";
+    Segment second = MakeSegment(first.name, first.base + first.size);
+    second.te_endpoint = first.te_endpoint;
+    second.protocol = first.protocol;
+    constexpr size_t object_size = 9 * 1024 * 1024;
+    const std::string first_key = "first_object";
+    const std::string second_key = "second_object";
+
+    // Only the first segment can serve the first put. Once the second segment
+    // is mounted, it is the only segment with room for another object.
+    ASSERT_TRUE(primary.MountSegment(first, client_id));
+    PutObject(primary, client_id, first_key, object_size);
+    ASSERT_TRUE(primary.MountSegment(second, client_id));
+    PutObject(primary, client_id, second_key, object_size);
+    primary.StopBatchOpLogWriter();
+
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+    const auto replay = reader.PollOnce();
+    ASSERT_EQ(ErrorCode::OK, replay.error);
+    ASSERT_EQ(4u, replay.applied_entries);
+    const auto cursor = reader.GetLastAppliedDurablePrefix();
+    ASSERT_TRUE(cursor);
+
+    for (const auto& [key, segment] :
+         {std::pair{first_key, first}, std::pair{second_key, second}}) {
+        SCOPED_TRACE(key);
+        const auto object = standby.GetMetadata(key);
+        ASSERT_TRUE(object);
+        ASSERT_EQ(1u, object->replicas.size());
+        const auto& replica = object->replicas.front();
+        ASSERT_TRUE(replica.is_memory_replica());
+        ASSERT_EQ(ReplicaStatus::COMPLETE, replica.status);
+        const auto& buffer = replica.get_memory_descriptor().buffer_descriptor;
+        ASSERT_EQ(segment.te_endpoint, buffer.transport_endpoint_);
+        ASSERT_EQ(object_size, buffer.size_);
+        ASSERT_GE(buffer.buffer_address_, segment.base);
+        ASSERT_LE(buffer.buffer_address_,
+                  segment.base + segment.size - object_size);
+    }
+
+    const auto& registry = applier.GetSegmentRegistry();
+    const auto segment = registry.GetSegment(first.te_endpoint);
+    ASSERT_TRUE(segment);
+    ReplicaID max_replica_id = 0;
+    ASSERT_TRUE(standby.ValidateReplicaIds(max_replica_id));
+    MasterService promoted(MasterServiceConfig::builder().build());
+    const auto restored = promoted.RestoreFromBatchOpLogPromotion(
+        standby, *cursor, registry.GetAllSegments(), max_replica_id, 1);
+    ASSERT_TRUE(restored) << toString(restored.error()) << ": endpoint "
+                          << first.te_endpoint << " has " << segment->capacity
+                          << " replayed bytes for " << 2 * object_size
+                          << " bytes of live replicas";
+    EXPECT_TRUE(
+        HasMetadataEntryForTesting(promoted, kDefaultTenant, first_key));
+    EXPECT_TRUE(
+        HasMetadataEntryForTesting(promoted, kDefaultTenant, second_key));
+}
+
 TEST_F(MasterServiceHATest, NotifyPromotionSuccessWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_promotion_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
