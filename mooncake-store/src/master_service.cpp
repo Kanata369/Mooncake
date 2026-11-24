@@ -72,6 +72,7 @@ tl::expected<OpLogEntry, ErrorCode> BuildSegmentMountOpLogEntry(
     op.segment_name = segment.name;
     op.transport_endpoint = segment.te_endpoint;
     op.capacity = segment.size;
+    op.range = StandbySegmentRange{segment.id, segment.base};
     op.is_memory_segment = true;
     auto bytes = struct_pack::serialize(op);
     OpLogEntry entry;
@@ -1012,8 +1013,8 @@ MasterService::~MasterService() {
     client_offboarding_worker_.Stop();
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
         MasterMetricManager::instance().dec_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
-        MasterMetricManager::instance().remove_segment_metrics(segment);
+            segment.first, static_cast<int64_t>(bytes));
+        MasterMetricManager::instance().remove_segment_metrics(segment.first);
     }
 
     // Segments still mounted here never went through CommitUnmountSegment;
@@ -1180,7 +1181,9 @@ ErrorCode MasterService::ValidateStandbyRemountSegment(
     const Segment& segment) const {
     const StandbySegmentInfo* match = nullptr;
     for (const auto& standby : standby_memory_segments_) {
-        if (standby.transport_endpoint == segment.te_endpoint ||
+        if (standby.range && standby.range->id != segment.id) continue;
+        if ((standby.range && standby.range->id == segment.id) ||
+            standby.transport_endpoint == segment.te_endpoint ||
             standby.segment_name == segment.name) {
             if (match != nullptr && match != &standby) {
                 return ErrorCode::INVALID_PARAMS;
@@ -1191,9 +1194,11 @@ ErrorCode MasterService::ValidateStandbyRemountSegment(
     if (match != nullptr && segment.protocol == "cxl") {
         return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
     }
-    if (match != nullptr && (match->segment_name != segment.name ||
-                             match->transport_endpoint != segment.te_endpoint ||
-                             match->capacity != segment.size)) {
+    if (match != nullptr &&
+        (match->segment_name != segment.name ||
+         match->transport_endpoint != segment.te_endpoint ||
+         match->capacity != segment.size ||
+         (match->range && match->range->base != segment.base))) {
         return ErrorCode::INVALID_PARAMS;
     }
     return ErrorCode::OK;
@@ -1234,6 +1239,19 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         {
             auto segment_access = segment_manager_.getSegmentAccess();
+            // A shared endpoint has a single remount/readiness transition. Do
+            // not open it (or commit the client session) for only one sibling.
+            for (const auto& standby : standby_memory_segments_) {
+                if (!standby.range) continue;
+                bool touched = false, included = false;
+                for (const auto& s : segments) {
+                    touched |= s.te_endpoint == standby.transport_endpoint ||
+                               s.name == standby.segment_name;
+                    included |= s.id == standby.range->id;
+                }
+                if (touched && !included)
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
             for (const auto& segment : segments) {
                 auto standby_validation =
                     ValidateStandbyRemountSegment(segment);
@@ -1335,9 +1353,17 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         // until the repair below: the replicas this walk collects stay put,
         // and each object it touched is locked again there by its publication.
         std::vector<std::pair<TenantId, route::ObjectRef>> affected_objects;
+        auto find_account = [this](const Segment& s) {
+            auto it = standby_accounted_memory_bytes_.find({s.name, s.id});
+            return it != standby_accounted_memory_bytes_.end()
+                       ? it
+                       : standby_accounted_memory_bytes_.find(
+                             {s.name, std::nullopt});
+        };
         bool any_standby_kept_alive = std::any_of(
-            segments.begin(), segments.end(), [this](const Segment& segment) {
-                return standby_accounted_memory_bytes_.contains(segment.name);
+            segments.begin(), segments.end(), [&](const Segment& segment) {
+                return find_account(segment) !=
+                       standby_accounted_memory_bytes_.end();
             });
         if (any_standby_kept_alive) {
             VisitNamespaces([&](const TenantId& tenant_id,
@@ -1459,8 +1485,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     uint64_t{0}, [](uint64_t sum, const auto& descriptor) {
                         return sum + descriptor.size_;
                     });
-                auto accounted =
-                    standby_accounted_memory_bytes_.find(restore.segment.name);
+                auto accounted = find_account(restore.segment);
                 if (accounted == standby_accounted_memory_bytes_.end() ||
                     accounted->second < restore.imported_size) {
                     return fail_remount(ErrorCode::INTERNAL_ERROR);
@@ -1494,8 +1519,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 MasterMetricManager::instance().dec_allocated_mem_size(
                     restore.segment.name,
                     static_cast<int64_t>(restore.imported_size));
-                auto accounted =
-                    standby_accounted_memory_bytes_.find(restore.segment.name);
+                auto accounted = find_account(restore.segment);
                 accounted->second -= restore.imported_size;
                 if (accounted->second == 0) {
                     standby_accounted_memory_bytes_.erase(accounted);
@@ -2685,7 +2709,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
 
             if (enable_oplog_ && ordered_oplog_writer_ &&
                 !it->transport_endpoint.empty()) {
-                SegmentUnmountOp op{it->transport_endpoint};
+                SegmentUnmountOp op{it->transport_endpoint, it->segment_id};
                 auto bytes = struct_pack::serialize(op);
                 auto persist_result = AppendOpLogVisibleBeforeDurable(
                     OpType::SEGMENT_UNMOUNT, TenantId::Default().value(),
@@ -2803,7 +2827,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
             return {};  // Unmount is idempotent for a missing segment.
         }
         if (reservation && !segment.te_endpoint.empty()) {
-            SegmentUnmountOp op{segment.te_endpoint};
+            SegmentUnmountOp op{segment.te_endpoint, segment.id};
             auto bytes = struct_pack::serialize(op);
             entry.emplace();
             entry->op_type = OpType::SEGMENT_UNMOUNT;
@@ -3218,11 +3242,10 @@ struct MasterService::PreparedObject {
 // would break the bounded-memory shape.
 struct MasterService::LegacyRestoreContext {
     const std::vector<StandbyObjectEntry>& objects;
-    const std::unordered_map<std::string, const StandbySegmentInfo*>&
-        segments_by_alias;
+    const StandbyRangeIndex& segments_by_alias;
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>&
         allocators;
-    std::unordered_map<std::string, uint64_t>& accounted_bytes;
+    StandbyUsage& accounted_bytes;
     size_t& rejected_count;
     size_t& already_existing_count;
     std::vector<std::pair<TenantId, std::string>>& repair_remove_keys;
@@ -3290,14 +3313,17 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
                 continue;
             }
             const auto& buffer = desc.get_memory_descriptor().buffer_descriptor;
-            auto segment_it =
-                ctx.segments_by_alias.find(buffer.transport_endpoint_);
-            if (segment_it == ctx.segments_by_alias.end()) {
+            auto group = ctx.segments_by_alias.Find(buffer.transport_endpoint_);
+            if (!group) {
                 NoteLegacyStandbyRejection(ctx, entry, "unknown_endpoint");
                 valid = false;
                 break;
             }
-            if (buffer.size_ != entry.metadata.size || buffer.size_ == 0 ||
+            const auto* segment = StandbyRangeIndex::Resolve(
+                *group, buffer.buffer_address_, buffer.size_,
+                buffer.protocol_ == "cxl");
+            if (!segment || buffer.size_ != entry.metadata.size ||
+                buffer.size_ == 0 ||
                 buffer.buffer_address_ >
                     std::numeric_limits<uintptr_t>::max() - buffer.size_) {
                 NoteLegacyStandbyRejection(ctx, entry,
@@ -3307,9 +3333,8 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
             }
             if (desc.status != ReplicaStatus::REMOVED &&
                 desc.status != ReplicaStatus::FAILED) {
-                object_ranges.emplace_back(segment_it->second,
-                                           buffer.buffer_address_, buffer.size_,
-                                           desc_idx);
+                object_ranges.emplace_back(segment, buffer.buffer_address_,
+                                           buffer.size_, desc_idx);
             }
         }
         if (!valid) {
@@ -3419,7 +3444,7 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
         // Per-object bytes join the segment totals only once the whole
         // object validates, so a mid-construction rejection never leaves
         // phantom accounting behind for later capacity checks or metrics.
-        std::unordered_map<std::string, uint64_t> object_bytes;
+        StandbyUsage object_bytes;
 
         for (size_t desc_idx = 0; desc_idx < standby_meta.replicas.size();
              ++desc_idx) {
@@ -3432,13 +3457,15 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                 const auto& buffer =
                     desc.get_memory_descriptor().buffer_descriptor;
                 auto alloc = ctx.allocators.at(buffer.transport_endpoint_);
-                const auto* segment =
-                    ctx.segments_by_alias.at(buffer.transport_endpoint_);
+                const auto* segment = StandbyRangeIndex::Resolve(
+                    *ctx.segments_by_alias.Find(buffer.transport_endpoint_),
+                    buffer.buffer_address_, buffer.size_,
+                    buffer.protocol_ == "cxl");
                 if (desc.status != ReplicaStatus::REMOVED &&
                     desc.status != ReplicaStatus::FAILED) {
                     const uint64_t used =
-                        ctx.accounted_bytes[segment->segment_name] +
-                        object_bytes[segment->segment_name];
+                        ctx.accounted_bytes[UsageKey(*segment)] +
+                        object_bytes[UsageKey(*segment)];
                     if (used > segment->capacity ||
                         buffer.size_ > segment->capacity - used) {
                         NoteLegacyStandbyRejection(ctx, entry,
@@ -3446,7 +3473,7 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                         construction_ok = false;
                         break;
                     }
-                    object_bytes[segment->segment_name] += buffer.size_;
+                    object_bytes[UsageKey(*segment)] += buffer.size_;
                 }
 
                 replicas.push_back(Replica(
@@ -3838,8 +3865,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     }
 
     std::vector<StandbySegmentInfo> restored_memory_segments;
-    std::unordered_map<std::string, const StandbySegmentInfo*>
-        memory_segments_by_alias;
+    StandbyRangeIndex memory_segments_by_alias;
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
         restored_allocators;
     std::unordered_set<std::string> restored_invalid_endpoints;
@@ -3855,12 +3881,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                        << ", capacity=" << seg.capacity;
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        const auto add_alias = [&](const std::string& alias) {
-            return memory_segments_by_alias.emplace(alias, &seg).second;
-        };
-        if (!add_alias(seg.transport_endpoint) ||
-            (seg.segment_name != seg.transport_endpoint &&
-             !add_alias(seg.segment_name))) {
+        if (!memory_segments_by_alias.Add(seg)) {
             LOG(ERROR)
                 << "RestoreFromStandbySnapshot: ambiguous memory segment "
                 << "name=" << seg.segment_name
@@ -3890,7 +3911,19 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         if (seg.segment_name != seg.transport_endpoint) {
             restored_allocators[seg.segment_name] = allocator;
         }
-        if (!segment_manager_.HasSegmentByEndpoint(seg.transport_endpoint)) {
+        bool mounted;
+        if (seg.range) {
+            Segment live;
+            auto access = segment_manager_.getSegmentAccess();
+            mounted = access.GetSegment(seg.range->id, live) &&
+                      live.name == seg.segment_name &&
+                      live.te_endpoint == seg.transport_endpoint &&
+                      live.base == seg.range->base && live.size == seg.capacity;
+        } else {
+            mounted =
+                segment_manager_.HasSegmentByEndpoint(seg.transport_endpoint);
+        }
+        if (!mounted) {
             restored_invalid_endpoints.insert(seg.transport_endpoint);
             if (seg.segment_name != seg.transport_endpoint) {
                 restored_invalid_endpoints.insert(seg.segment_name);
@@ -3901,7 +3934,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     // Batch restore spans chunks, so it needs an ordered cross-chunk index.
     std::unordered_map<const StandbySegmentInfo*, std::map<uintptr_t, uint64_t>>
         bounded_memory_ranges;
-    std::unordered_map<std::string, uint64_t> restored_accounted_memory_bytes;
+    StandbyUsage restored_accounted_memory_bytes;
     size_t restored_object_count = 0;
     size_t dropped_stale_replica_count = 0;
     size_t skipped_stale_object_count = 0;
@@ -3955,9 +3988,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                 if (desc.is_memory_replica()) {
                     const auto& buffer =
                         desc.get_memory_descriptor().buffer_descriptor;
-                    auto segment_it = memory_segments_by_alias.find(
+                    auto group = memory_segments_by_alias.Find(
                         buffer.transport_endpoint_);
-                    if (segment_it == memory_segments_by_alias.end()) {
+                    if (!group) {
                         // The snapshot can still carry replicas on segments
                         // that were unloaded before the handoff. Those are
                         // gone for good, so drop just these replicas instead
@@ -3984,12 +4017,15 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                     }
 
-                    const auto* segment = segment_it->second;
+                    const auto* segment = StandbyRangeIndex::Resolve(
+                        *group, buffer.buffer_address_, buffer.size_,
+                        buffer.protocol_ == "cxl");
+                    if (!segment)
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                     if (desc.status != ReplicaStatus::REMOVED &&
                         desc.status != ReplicaStatus::FAILED) {
                         auto& bytes =
-                            restored_accounted_memory_bytes[segment
-                                                                ->segment_name];
+                            restored_accounted_memory_bytes[UsageKey(*segment)];
                         if (bytes > segment->capacity ||
                             buffer.size_ > segment->capacity - bytes) {
                             LOG(ERROR)
@@ -4312,11 +4348,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     // the gauge drift between the map swap and this commit.
     for (const auto& [segment, bytes] : prev_standby_accounted_memory_bytes) {
         MasterMetricManager::instance().dec_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
+            segment.first, static_cast<int64_t>(bytes));
     }
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
         MasterMetricManager::instance().inc_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
+            segment.first, static_cast<int64_t>(bytes));
     }
 
     LOG(INFO) << "Restored from standby: " << restored_object_count

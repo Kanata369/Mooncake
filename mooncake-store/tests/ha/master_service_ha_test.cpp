@@ -6843,21 +6843,39 @@ TEST_F(MasterServiceHATest, BatchPromotionRestoresSharedEndpointSegments) {
     }
 
     const auto& registry = applier.GetSegmentRegistry();
-    const auto segment = registry.GetSegment(first.te_endpoint);
-    ASSERT_TRUE(segment);
+    auto segments = registry.GetAllSegments();
+    ASSERT_EQ(segments.size(), 2u);
     ReplicaID max_replica_id = 0;
     ASSERT_TRUE(standby.ValidateReplicaIds(max_replica_id));
-    MasterService promoted(MasterServiceConfig::builder().build());
+    MasterService promoted(
+        MasterServiceConfig::builder()
+            .set_memory_allocator(BufferAllocatorType::OFFSET)
+            .build());
     const auto restored = promoted.RestoreFromBatchOpLogPromotion(
-        standby, *cursor, registry.GetAllSegments(), max_replica_id, 1);
-    ASSERT_TRUE(restored) << toString(restored.error()) << ": endpoint "
-                          << first.te_endpoint << " has " << segment->capacity
-                          << " replayed bytes for " << 2 * object_size
-                          << " bytes of live replicas";
-    EXPECT_TRUE(
-        HasMetadataEntryForTesting(promoted, kDefaultTenant, first_key));
-    EXPECT_TRUE(
-        HasMetadataEntryForTesting(promoted, kDefaultTenant, second_key));
+        standby, *cursor, segments, max_replica_id, 1);
+    ASSERT_TRUE(restored) << toString(restored.error());
+    EXPECT_FALSE(promoted.ReMountSegment({first}, client_id));
+    for (const auto& key : {first_key, second_key}) {
+        auto before = promoted.GetReplicaList(key, kDefaultTenant);
+        ASSERT_FALSE(before) << key;
+        EXPECT_EQ(before.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    ASSERT_TRUE(promoted.ReMountSegment({second, first}, client_id));
+    for (const auto& key : {first_key, second_key}) {
+        auto after = promoted.GetReplicaList(key, kDefaultTenant);
+        ASSERT_TRUE(after) << key;
+        ASSERT_EQ(after->replicas.size(), 1u);
+        const auto& buffer =
+            after->replicas.front().get_memory_descriptor().buffer_descriptor;
+        auto original = standby.GetMetadata(key);
+        ASSERT_TRUE(original);
+        const auto& expected = original->replicas.front()
+                                   .get_memory_descriptor()
+                                   .buffer_descriptor;
+        EXPECT_EQ(buffer.transport_endpoint_, expected.transport_endpoint_);
+        EXPECT_EQ(buffer.buffer_address_, expected.buffer_address_);
+        EXPECT_EQ(buffer.size_, expected.size_);
+    }
 }
 
 TEST_F(MasterServiceHATest, NotifyPromotionSuccessWritesBatchRecordOpLog) {

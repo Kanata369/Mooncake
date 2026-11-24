@@ -110,7 +110,7 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
             ApplySegmentMount(entry);
             break;
         case OpType::SEGMENT_UNMOUNT:
-            ApplySegmentUnmount(entry);
+            applied = ApplySegmentUnmount(entry);
             break;
         case OpType::SEGMENT_UPDATE:
             ApplySegmentUpdate(entry);
@@ -525,18 +525,20 @@ void OpLogApplier::ApplySegmentMount(const OpLogEntry& entry) {
     info.capacity = op.capacity;
     info.is_memory_segment = op.is_memory_segment;
     info.file_path = op.file_path;
+    info.range = op.range;
     segment_registry_.OnSegmentMount(info);
 }
 
-void OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
+bool OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
     SegmentUnmountOp op;
     if (struct_pack::deserialize_to(op, entry.payload) !=
         struct_pack::errc::ok) {
         LOG(ERROR) << "Failed to deserialize SEGMENT_UNMOUNT payload for key "
                    << entry.object_key;
-        return;
+        return true;  // Preserve legacy malformed-payload handling.
     }
-    segment_registry_.OnSegmentUnmount(op.transport_endpoint);
+    return segment_registry_.OnSegmentUnmount(op.transport_endpoint,
+                                              op.segment_id);
 }
 
 void OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {
@@ -553,6 +555,7 @@ void OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {
     info.capacity = op.capacity;
     info.is_memory_segment = op.is_memory_segment;
     info.file_path = op.file_path;
+    info.range = op.range;
     segment_registry_.OnSegmentUpdate(info);
 }
 

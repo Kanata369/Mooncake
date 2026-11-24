@@ -56,7 +56,7 @@ class OpLogApplier {
 
     const StandbySegmentRegistry& GetSegmentRegistry() const;
     void ApplySegmentMount(const OpLogEntry& entry);
-    void ApplySegmentUnmount(const OpLogEntry& entry);
+    bool ApplySegmentUnmount(const OpLogEntry& entry);
     void ApplySegmentUpdate(const OpLogEntry& entry);
 
     /**

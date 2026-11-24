@@ -2347,7 +2347,7 @@ class MasterService {
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
         standby_allocator_keepalive_;
     std::vector<StandbySegmentInfo> standby_memory_segments_;
-    std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
+    StandbyUsage standby_accounted_memory_bytes_;
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 

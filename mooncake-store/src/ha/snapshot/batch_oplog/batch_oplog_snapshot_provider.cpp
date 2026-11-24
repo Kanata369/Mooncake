@@ -112,12 +112,18 @@ AttemptResult ReadDescriptorObject(SnapshotObjectStore& object_store,
 }
 
 bool ValidateSegments(const std::vector<StandbySegmentInfo>& segments) {
-    std::unordered_set<std::string> endpoints;
-    for (const auto& segment : segments) {
-        if (segment.transport_endpoint.empty() ||
-            !endpoints.insert(segment.transport_endpoint).second) {
+    StandbyRangeIndex memory;
+    std::unordered_set<std::string> other_endpoints;
+    for (const auto& s : segments) {
+        if (!s.is_memory_segment &&
+            (s.transport_endpoint.empty() ||
+             !other_endpoints.insert(s.transport_endpoint).second))
             return false;
-        }
+    }
+    for (const auto& s : segments) {
+        if (s.is_memory_segment &&
+            (other_endpoints.contains(s.transport_endpoint) || !memory.Add(s)))
+            return false;
     }
     return true;
 }

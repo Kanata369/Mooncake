@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 
+#include "ha/standby_segment.h"
 #include "types.h"
 #include "weight_management.h"
 
@@ -54,34 +55,6 @@ struct WeightLeaseDeleteOp {
                            const WeightLeaseDeleteOp&) = default;
 };
 YLT_REFL(WeightLeaseDeleteOp, lease_id, identity, fenced_metadata_generation);
-
-struct SegmentMountOp {
-    std::string segment_name;
-    std::string transport_endpoint;
-    uint64_t capacity{0};
-    bool is_memory_segment{false};
-    std::string file_path;
-
-    YLT_REFL(SegmentMountOp, segment_name, transport_endpoint, capacity,
-             is_memory_segment, file_path);
-};
-
-struct SegmentUnmountOp {
-    std::string transport_endpoint;
-
-    YLT_REFL(SegmentUnmountOp, transport_endpoint);
-};
-
-struct SegmentUpdateOp {
-    std::string segment_name;
-    std::string transport_endpoint;
-    uint64_t capacity{0};
-    bool is_memory_segment{false};
-    std::string file_path;
-
-    YLT_REFL(SegmentUpdateOp, segment_name, transport_endpoint, capacity,
-             is_memory_segment, file_path);
-};
 
 struct OpLogEntry {
     uint64_t sequence_id{0};

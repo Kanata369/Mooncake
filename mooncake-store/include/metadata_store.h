@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "ha/standby_segment.h"
 #include "replica.h"
 #include "types.h"
 #include "weight_metadata_store.h"
@@ -52,21 +53,6 @@ struct StandbyObjectMetadata {
 
     // Check if this metadata has valid replicas
     bool HasReplicas() const { return !replicas.empty(); }
-};
-
-/**
- * Segment info stored in standby's segment registry.
- * Used for recovering segment view after promotion.
- */
-struct StandbySegmentInfo {
-    std::string segment_name;
-    std::string transport_endpoint;
-    uint64_t capacity{0};
-    bool is_memory_segment{false};
-    std::string file_path;  // empty for memory segments
-
-    YLT_REFL(StandbySegmentInfo, segment_name, transport_endpoint, capacity,
-             is_memory_segment, file_path);
 };
 
 /**
@@ -134,32 +120,6 @@ struct MetadataPayload {
         meta.residency_affinity_id = residency_affinity_id.value_or("");
         return meta;
     }
-};
-
-/**
- * Thread-safe registry of segments known to standby.
- * Maintained by applying SEGMENT_MOUNT/UNMOUNT/UPDATE OpLog events.
- * Used to reconstruct segment view after promotion.
- */
-class StandbySegmentRegistry {
-   public:
-    StandbySegmentRegistry() = default;
-
-    // Segment lifecycle events
-    void OnSegmentMount(const StandbySegmentInfo& info);
-    void OnSegmentUnmount(const std::string& transport_endpoint);
-    void OnSegmentUpdate(const StandbySegmentInfo& info);
-
-    // Queries
-    bool HasSegment(const std::string& transport_endpoint) const;
-    std::optional<StandbySegmentInfo> GetSegment(
-        const std::string& transport_endpoint) const;
-    std::vector<StandbySegmentInfo> GetAllSegments() const;
-    void Clear();
-
-   private:
-    mutable std::shared_mutex mutex_;
-    std::unordered_map<std::string, StandbySegmentInfo> segments_by_endpoint_;
 };
 
 /**
